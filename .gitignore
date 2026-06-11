@@ -1,0 +1,28 @@
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# System files
+*.log
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Documentation files (local, not committed)
+*.md.bak
+
+# IDE specific
+.phpunit.result.cache
+.phpactor.json
+
+# Project files (keep repo clean)
+*.tmp
+*.temp

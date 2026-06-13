@@ -10,6 +10,8 @@
 > **Asumsi semantik kunci (mengikat seluruh dokumen):**
 > Status `Lolos Seleksi` yang sudah ada diperlakukan sebagai **lolos seleksi administrasi/berkas**. Pendaftar yang berstatus `Lolos Seleksi` adalah peserta yang **berhak dijadwalkan** untuk **tes tulis + wawancara**, sebelum akhirnya melakukan heregistrasi. Dengan begitu modul ini berdiri **di antara** status `Lolos Seleksi` → `heregistrasi`, dan **hanya membaca** data pendaftar yang ada tanpa mengubah alur lama.
 
+> **Catatan revisi (review ulang vs kode existing):** dokumen ini telah melewati review terhadap kode nyata. Penyesuaian utama: (1) tipe kolom memakai `VARCHAR + konstanta model` mengikuti pola existing (`pendaftars.status`), bukan `ENUM`; (2) endpoint publik jadwal diberi **faktor verifikasi kedua + rate limit** karena `nomor_pendaftaran` mudah ditebak (`PMB-2025-XXXX`, ~9.000 kombinasi, tanpa throttle); (3) timezone `Asia/Jakarta` & **normalisasi `nomor_hp` 08→62** untuk reminder/WhatsApp; (4) `react-day-picker`/`date-fns` diturunkan jadi **opsional** (input `date/time` native cukup); (5) klaim `StatusBadge` dikoreksi (perlu diperluas, bukan reuse apa adanya). Bagian 5 menyediakan **prompt tunggal (5A)** + **eksekusi bertahap (5B)**.
+
 ---
 
 # BAGIAN 1 — Analisa Teknis
@@ -31,7 +33,7 @@
 
 **Admin / Panitia PMB**
 1. CRUD **sesi tes/wawancara**: tanggal, waktu mulai–selesai, lokasi (offline) atau link (online), kuota, dan penguji yang ditugaskan.
-2. **Assign peserta** Lolos Seleksi ke sesi — manual (pilih satu/banyak) atau **auto-distribute** sesuai kuota & prodi.
+2. **Assign peserta** Lolos Seleksi ke sesi — manual (pilih satu/banyak) atau **auto-distribute** sesuai kuota & prodi (mencocokkan `pendaftars.prodi` dengan kolom `sesi_tes.prodi_target`; `prodi_target` kosong = sesi untuk semua prodi).
 3. **Dashboard monitoring**: kapasitas terisi per sesi, rekap kehadiran (Terjadwal/Hadir/Tidak Hadir), dan peserta yang belum punya jadwal.
 4. **Kelola permintaan reschedule**: lihat antrean, setujui (pindahkan ke sesi lain) atau tolak dengan alasan.
 5. **Kirim notifikasi & reminder** multi-channel (in-app + email + WhatsApp) secara massal/per sesi.
@@ -55,15 +57,17 @@
 
 | Komponen | Pilihan | Alasan |
 |----------|---------|--------|
-| Pemilih tanggal/waktu (FE) | `react-day-picker` | Memilih slot tanggal sesi tanpa membangun kalender dari nol; ringan & mudah di-styling Tailwind agar konsisten dengan UI existing. |
-| Format tanggal lokal (FE) | `date-fns` (+ locale `id`) | Menampilkan tanggal/jam dalam format Indonesia yang rapi & konsisten lintas komponen. |
-| Pengiriman email (BE) | **Laravel Mail** + Markdown Mailable | Native di Laravel, tanpa dependensi eksternal; template email jadwal & reminder mudah dibuat. |
-| Antrean tugas (BE) | **Laravel Queue** driver `database` | Pengiriman email/WhatsApp dijalankan asinkron agar tidak memblok request; driver `database` cocok dengan SQLite (tabel `jobs`). |
-| Penjadwal tugas (BE) | **Laravel Task Scheduler** + Artisan command | Mengirim reminder **H-1** otomatis (`schedule:run`) tanpa setup cron yang rumit. |
-| Gateway WhatsApp (BE) | **Fonnte / Twilio** via `Http::post` (Laravel HTTP Client) | Sesuai brief (panitia kini pakai WhatsApp). Memakai HTTP Client bawaan, tanpa SDK berat; Fonnte murah & populer di Indonesia. |
+| Input tanggal/waktu (FE) | **Native `<input type="date"/"time">`** (opsional: `react-day-picker`) | Komponen `Input` existing sudah meneruskan `type`, jadi date/time picker native HTML5 **sudah cukup** untuk prototype. `react-day-picker` hanya ditambahkan bila butuh kalender visual — bukan keharusan, agar tidak over-engineering. |
+| Format tanggal lokal (FE) | **`Date.toLocaleDateString('id-ID')`** (opsional: `date-fns`) | Format tanggal Indonesia bisa dicapai native (pola yang sudah dipakai komponen existing). `date-fns` opsional bila perlu manipulasi tanggal lebih kompleks. |
+| Pengiriman email (BE) | **Laravel Mail** + Markdown Mailable | Native di Laravel; `MAIL_MAILER=log` (default existing) membuat email "terkirim ke log" tanpa SMTP → cocok untuk demo. |
+| Antrean tugas (BE) | **Laravel Queue** driver `database` | Sudah jadi default (`QUEUE_CONNECTION=database`) & tabel `jobs` sudah ada. Email/WA dikirim asinkron. Catatan: butuh `php artisan queue:work` berjalan agar job benar-benar diproses. |
+| Penjadwal tugas (BE) | **Laravel Task Scheduler** + Artisan command | Mengirim reminder **H-1** otomatis tanpa cron rumit. Perhitungan "besok" memakai timezone `Asia/Jakarta` (lihat 1.4). |
+| Gateway WhatsApp (BE) | **Fonnte / Twilio** via `Http::post` (Laravel HTTP Client) | Sesuai brief (panitia kini pakai WhatsApp); HTTP Client bawaan, tanpa SDK berat. Perlu **normalisasi `nomor_hp` 08→62** sebelum kirim (format existing `\d{10,13}` belum siap pakai). |
 | Notifikasi in-app | Reuse pola fetch existing pada halaman Cek Status | Peserta langsung melihat jadwal saat cek status; tanpa library tambahan. |
 
-> Prinsip: **tidak mengganti stack inti**, hanya menambah pustaka pendukung yang relevan dengan kebutuhan modul (kalender, multi-channel notifikasi, penjadwalan reminder).
+> Prinsip: **tidak mengganti stack inti**, hanya menambah pustaka pendukung **seperlunya** (utamakan kapabilitas native dulu). Pustaka tambahan (`react-day-picker`, `date-fns`) bersifat opsional.
+>
+> *Catatan opsional:* response API existing ditulis manual `{ success, data, message }` di tiap method (tanpa helper). Modul baru menambah beberapa controller, jadi sebuah trait kecil `ApiResponse` boleh dipertimbangkan untuk merapikan — opsional, bukan keharusan.
 
 ## 1.4 Batasan & Asumsi
 
@@ -72,6 +76,11 @@
 3. **Integrasi lewat foreign key, bukan modifikasi tabel lama.** Keterhubungan ke pendaftar memakai FK `pendaftar_id → pendaftars.id` di tabel baru. **Tidak ada** kolom baru yang ditambahkan ke `pendaftars`. Satu-satunya sentuhan ke tabel lama adalah penambahan kolom **additive** `role` di `users` (default `'admin'`, aman untuk data lama) guna membedakan admin vs penguji.
 4. **Auth peserta tetap *lightweight*.** Peserta mengakses jadwalnya melalui **nomor pendaftaran** (mengikuti pola Cek Status existing), tanpa membangun sistem login peserta penuh — menjaga konsistensi arsitektur.
 5. **Notifikasi bergantung konfigurasi `.env`.** Email (SMTP) dan WhatsApp (token gateway) dibaca dari `.env`. Bila tidak dikonfigurasi, modul tetap berjalan dengan **degradasi anggun**: notifikasi in-app tetap aktif, sedangkan email/WA dicatat `gagal`/`tertunda` di log tanpa menghentikan proses penjadwalan.
+6. **Endpoint publik perlu faktor verifikasi kedua + rate limit.** `nomor_pendaftaran` mudah ditebak (`PMB-2025-XXXX` = `random_int(1000,9999)`, ~9.000 kombinasi) dan route publik existing **tidak punya throttle**. Karena modul ini membocorkan data lebih sensitif (jadwal, lokasi, link online), endpoint jadwal peserta **wajib** meminta **faktor kedua** (mis. 4 digit terakhir `nomor_hp` atau tanggal lahir) dan diberi middleware **`throttle`**. (Mengikat Bagian 3.3.)
+7. **Timezone `Asia/Jakarta`.** `config/app.php` existing memakai `UTC`. Reminder H-1 ("sesi besok") dan tampilan jam **harus** memakai zona `Asia/Jakarta` (set di config atau konversi eksplisit) agar tidak meleset ±7 jam.
+8. **`nomor_hp` perlu dinormalisasi untuk WhatsApp.** Format existing `^\d{10,13}$` menyimpan `08…`. Sebelum kirim WA dilakukan normalisasi `08…→62…`; nomor tak valid dicatat `gagal` di `notifikasi_log` (tidak menghentikan proses).
+9. **Otorisasi berbasis `users.role`.** Token Sanctum tidak otomatis membedakan peran; endpoint admin diberi gate/middleware `role:admin` dan endpoint penguji `role:penguji`, sehingga token penguji tidak bisa mengakses fungsi admin.
+10. **`StatusBadge` perlu dimodifikasi, bukan reuse apa adanya.** `StatusBadge.jsx` existing meng-hardcode 3 status pendaftaran. Untuk `status_kehadiran`, peta warnanya **harus diperluas** (modifikasi komponen shared → wajib uji regresi pada tampilan status lama) **atau** dibuat komponen `KehadiranBadge` terpisah.
 
 ---
 
@@ -105,15 +114,17 @@
 ```
 [Peserta] → di halaman jadwal (Cek Status) klik "Ajukan Reschedule"
 [Peserta] → isi alasan (+ pilih sesi tujuan opsional) → submit            → [INSERT permintaan_reschedule, status='Menunggu']
-[Sistem]  → notifikasi ke admin (antrean reschedule bertambah)            → [INSERT notifikasi_log]
+[Admin]   → buka dashboard reschedule (polling GET, bukan push)           → [badge antrean 'Menunggu' bertambah]
 [Admin]   → review permintaan
           ↓ jika DISETUJUI (dan kuota sesi tujuan masih ada)
-[Admin]   → pindahkan peserta ke sesi baru                                → [UPDATE jadwal_peserta.sesi_tes_id; permintaan_reschedule.status='Disetujui', diproses_oleh, diproses_at]
+[Admin]   → pindahkan peserta ke sesi baru                                → [UPDATE jadwal_peserta.sesi_tes_id + status_kehadiran='Terjadwal'; permintaan_reschedule.status='Disetujui', diproses_oleh, diproses_at]
 [Sistem]  → notifikasi peserta: jadwal baru                               → [INSERT notifikasi_log]
           ↓ jika DITOLAK
 [Admin]   → tolak + tulis alasan                                          → [UPDATE permintaan_reschedule.status='Ditolak', diproses_oleh, diproses_at]
 [Sistem]  → notifikasi peserta: permintaan ditolak                        → [INSERT notifikasi_log]
 ```
+
+> Catatan: tidak ada mekanisme *push* ke admin — admin mengetahui permintaan baru lewat **polling dashboard** (`notifikasi_log` hanya untuk peserta). Riwayat tiap pengajuan tersimpan di `permintaan_reschedule` (sesi asal tetap terlacak lewat relasi ke `jadwal_peserta`), sedangkan `status_kehadiran` di-reset ke `Terjadwal` untuk sesi yang baru.
 
 ## 2.3 Happy Path vs Error Path (untuk Flow 2.1)
 
@@ -125,7 +136,8 @@
 |---|---------------|---------------|
 | 1 | **Kuota sesi penuh** saat admin meng-assign peserta tambahan. | Validasi backend menolak assignment (jumlah `jadwal_peserta` untuk sesi ≥ `kuota`), mengembalikan pesan "Kuota sesi penuh", dan UI meminta admin memilih sesi lain. |
 | 2 | **Pengiriman email/WhatsApp gagal** (SMTP down / nomor HP invalid / token gateway salah). | Jadwal **tetap tersimpan**; `notifikasi_log.status_kirim='gagal'` + `error_message`; notifikasi in-app tetap tampil; admin melihat indikator "notif gagal" dan dapat **kirim ulang**. (degradasi anggun) |
-| 3 | **Double-assign** peserta ke sesi yang sama / tipe yang sama. | Dicegah oleh `UNIQUE(pendaftar_id, sesi_tes_id)`; backend mengembalikan error duplikasi sehingga peserta tidak terjadwal ganda. |
+| 3 | **Double-assign** peserta. | Dua lapis: (a) sesi yang **persis sama** dicegah oleh `UNIQUE(pendaftar_id, sesi_tes_id)`; (b) dua sesi ber-**tipe sama** (mis. dua "Tes Tulis") dicegah **validasi aplikasi** — backend menolak assign bila peserta sudah punya jadwal dengan `tipe` tersebut. |
+| 4 | **Race condition kuota** (dua admin assign bersamaan ke sesi hampir penuh). | Cek-kuota lalu insert dibungkus **DB transaction + lock** (mis. `lockForUpdate` saat menghitung peserta sesi) agar jumlah tidak melebihi `kuota`. Untuk skala prototype boleh dicatat sebagai batasan, tapi pola transaksi tetap direkomendasikan. |
 
 ---
 
@@ -153,12 +165,12 @@
 ## 3.2 Alur Data: Peserta Cek Jadwal
 
 ```
-[Peserta input nomor_pendaftaran]             (React: CekStatus.jsx — halaman existing diperluas)
-        → [GET /api/jadwal/peserta/{nomor_pendaftaran}]   (publik, pola sama seperti /pendaftar/{nomor})
-        → [JadwalPesertaController@byNomor]   (Laravel)
-              → JOIN pendaftars ⋈ jadwal_peserta ⋈ sesi_tes
+[Peserta input nomor_pendaftaran + faktor kedua]   (React: CekStatus.jsx — halaman existing diperluas)
+        → [GET /api/jadwal/peserta/{nomor}?verifikasi=XXXX]   (publik + middleware throttle; faktor kedua = 4 digit akhir nomor_hp / tgl lahir)
+        → [JadwalPesertaController@byNomor]   (Laravel: validasi nomor + faktor kedua cocok)
+              → JOIN pendaftars ⋈ jadwal_peserta ⋈ sesi_tes  (TANPA kolom catatan_penguji/hasil)
         → [return { success: true, data: [ {sesi, tanggal, jam, lokasi/link, status_kehadiran} ] }]
-        → [React render kartu jadwal + StatusBadge]       (komponen UI existing di-reuse)
+        → [React render kartu jadwal + badge kehadiran]   (StatusBadge diperluas / KehadiranBadge baru — bukan reuse apa adanya)
         → [Output ke Pengguna]                (peserta melihat jadwal + tombol Konfirmasi / Ajukan Reschedule)
 ```
 
@@ -172,6 +184,8 @@
 | `catatan_penguji` / hasil | `jadwal_peserta` | Penilaian internal; **tidak** ditampilkan ke peserta sampai diputuskan resmi, agar integritas seleksi terjaga. |
 | `alasan` reschedule | `permintaan_reschedule` | Bisa memuat informasi pribadi/medis; akses terbatas untuk admin. |
 
+> **Mekanisme proteksi (konsisten dgn Bagian 1.4 poin 6):** karena `nomor_pendaftaran` mudah ditebak dan endpoint jadwal bersifat publik, akses ke data jadwal/PII di atas **wajib** lewat **faktor verifikasi kedua** (mis. 4 digit terakhir `nomor_hp` atau tanggal lahir) + middleware **`throttle`** untuk mencegah enumerasi. Endpoint hanya mengembalikan data milik pemilik nomor, dan **tidak pernah** menyertakan `catatan_penguji`/hasil.
+
 ---
 
 # BAGIAN 4 — ERD / Desain Database
@@ -182,7 +196,7 @@
 
 | Nama Tabel | Deskripsi |
 |------------|-----------|
-| `sesi_tes` | Slot sesi tes tulis / wawancara yang dibuat admin (tanggal, waktu, lokasi/link, kuota, penguji). |
+| `sesi_tes` | Slot sesi tes tulis / wawancara yang dibuat admin (tanggal, waktu, lokasi/link, kuota, penguji, `prodi_target`). |
 | `jadwal_peserta` | Penugasan peserta (pendaftar Lolos Seleksi) ke sebuah sesi — **tabel pivot inti** yang mengintegrasikan modul ini ke `pendaftars`. Menyimpan status kehadiran & konfirmasi. |
 | `permintaan_reschedule` | Permintaan perubahan jadwal dari peserta beserta keputusan admin. |
 | `notifikasi_log` | Catatan pengiriman notifikasi (in-app/email/WhatsApp) per jadwal — untuk audit, status kirim, dan reminder. |
@@ -192,12 +206,15 @@
 
 ## 4.2 Struktur Tiap Tabel
 
+> **Konvensi tipe (mengikuti sistem existing):** kolom berisi nilai terbatas memakai **`VARCHAR` + konstanta di model + validasi `in:`** (persis pola `pendaftars.status` / `Pendaftar::STATUS_*`), **bukan `ENUM`** — karena tak ada satu pun `enum()` di migration existing dan SQLite menyulitkan perubahan nilai enum. Nilai yang diizinkan dicantumkan di kolom Keterangan.
+
 ### `sesi_tes`
 | Nama Kolom | Tipe Data | Constraint | Keterangan |
 |------------|-----------|------------|------------|
 | `id` | BIGINT UNSIGNED | PK, AUTO_INCREMENT | Primary key. |
 | `kode_sesi` | VARCHAR(20) | UNIQUE, NOT NULL | Kode unik sesi, mis. `TES-2025-001`. |
-| `tipe` | ENUM('Tes Tulis','Wawancara') | NOT NULL | Jenis sesi. |
+| `tipe` | VARCHAR(20) | NOT NULL, in: | Nilai: `Tes Tulis` / `Wawancara` (konstanta model + validasi). |
+| `prodi_target` | VARCHAR(50) | NULLABLE | Prodi sasaran sesi (untuk auto-distribute); `NULL` = semua prodi. |
 | `tanggal` | DATE | NOT NULL | Tanggal pelaksanaan. |
 | `waktu_mulai` | TIME | NOT NULL | Jam mulai. |
 | `waktu_selesai` | TIME | NOT NULL | Jam selesai. |
@@ -213,7 +230,7 @@
 | `id` | BIGINT UNSIGNED | PK, AUTO_INCREMENT | Primary key. |
 | `pendaftar_id` | BIGINT UNSIGNED | NOT NULL, FK → `pendaftars.id`, ON DELETE CASCADE | **Titik integrasi** ke data pendaftar. |
 | `sesi_tes_id` | BIGINT UNSIGNED | NOT NULL, FK → `sesi_tes.id`, ON DELETE CASCADE | Sesi yang ditugaskan. |
-| `status_kehadiran` | ENUM('Terjadwal','Hadir','Tidak Hadir','Dijadwal Ulang') | NOT NULL, DEFAULT 'Terjadwal' | Status kehadiran peserta. |
+| `status_kehadiran` | VARCHAR(20) | NOT NULL, DEFAULT 'Terjadwal', in: | Nilai: `Terjadwal` / `Hadir` / `Tidak Hadir` / `Dijadwal Ulang` (konstanta model + validasi). |
 | `konfirmasi_hadir` | BOOLEAN | NOT NULL, DEFAULT false | RSVP peserta. |
 | `konfirmasi_at` | TIMESTAMP | NULLABLE | Waktu peserta mengonfirmasi. |
 | `catatan_penguji` | TEXT | NULLABLE | Catatan/hasil internal dari penguji. |
@@ -227,7 +244,7 @@
 | `jadwal_peserta_id` | BIGINT UNSIGNED | NOT NULL, FK → `jadwal_peserta.id`, ON DELETE CASCADE | Jadwal yang ingin diubah. |
 | `alasan` | TEXT | NOT NULL | Alasan reschedule dari peserta. |
 | `sesi_tujuan_id` | BIGINT UNSIGNED | NULLABLE, FK → `sesi_tes.id` | Preferensi sesi baru (opsional). |
-| `status` | ENUM('Menunggu','Disetujui','Ditolak') | NOT NULL, DEFAULT 'Menunggu' | Status keputusan. |
+| `status` | VARCHAR(20) | NOT NULL, DEFAULT 'Menunggu', in: | Nilai: `Menunggu` / `Disetujui` / `Ditolak` (konstanta model + validasi). |
 | `diproses_oleh` | BIGINT UNSIGNED | NULLABLE, FK → `users.id` | Admin yang memproses. |
 | `diproses_at` | TIMESTAMP | NULLABLE | Waktu diproses. |
 | `created_at` / `updated_at` | TIMESTAMP | NULLABLE | Audit waktu. |
@@ -237,9 +254,9 @@
 |------------|-----------|------------|------------|
 | `id` | BIGINT UNSIGNED | PK, AUTO_INCREMENT | Primary key. |
 | `jadwal_peserta_id` | BIGINT UNSIGNED | NOT NULL, FK → `jadwal_peserta.id`, ON DELETE CASCADE | Jadwal terkait. |
-| `channel` | ENUM('in_app','email','whatsapp') | NOT NULL | Kanal pengiriman. |
+| `channel` | VARCHAR(20) | NOT NULL, in: | Nilai: `in_app` / `email` / `whatsapp` (konstanta model + validasi). |
 | `tipe` | VARCHAR(50) | NOT NULL | Jenis notif, mis. `jadwal_dibuat`, `reminder_h1`, `reschedule_disetujui`. |
-| `status_kirim` | ENUM('terkirim','gagal','tertunda') | NOT NULL, DEFAULT 'tertunda' | Status pengiriman. |
+| `status_kirim` | VARCHAR(20) | NOT NULL, DEFAULT 'tertunda', in: | Nilai: `terkirim` / `gagal` / `tertunda` (konstanta model + validasi). |
 | `error_message` | VARCHAR(255) | NULLABLE | Pesan error bila gagal. |
 | `dikirim_at` | TIMESTAMP | NULLABLE | Waktu berhasil terkirim. |
 | `created_at` / `updated_at` | TIMESTAMP | NULLABLE | Audit waktu. |
@@ -295,14 +312,121 @@ Keterangan: Tiap jadwal memiliki banyak entri log notifikasi (per channel & per 
 | `status_kehadiran` | `jadwal_peserta` | Filter dashboard kehadiran (Terjadwal/Hadir/Tidak Hadir). |
 | `status` | `permintaan_reschedule` | Admin memfilter antrean `WHERE status='Menunggu'`. |
 | (`jadwal_peserta_id`, `channel`) | `notifikasi_log` | Cek status kirim per channel & basis reminder. |
+| `prodi_target` | `sesi_tes` | Filter sesi per prodi saat auto-distribute (`WHERE prodi_target IS NULL OR prodi_target = ?`). |
 
 > Prinsip indexing: prioritaskan **kolom FK yang sering di-JOIN** dan **kolom status/tanggal yang sering muncul di klausa WHERE/filter dashboard** — bukan semua kolom.
+>
+> *Catatan keunikan:* `UNIQUE(pendaftar_id, sesi_tes_id)` hanya menjamin satu baris per pasangan peserta–sesi. Larangan **dua sesi ber-tipe sama** (mis. dua "Tes Tulis") **tidak** dapat di-enforce di level DB (karena `tipe` ada di `sesi_tes`, bukan `jadwal_peserta`) → ditegakkan di **validasi aplikasi** saat assign.
 
 ---
 
-# BAGIAN 5 — Prompt Siap Pakai untuk AI (Dipecah per Tahap)
+# BAGIAN 5 — Prompt Siap Pakai untuk AI
 
-> Alih-alih **satu prompt besar**, Bagian 5 ini dipecah menjadi **6 prompt berurutan** yang dijalankan **satu per satu**. Tujuannya: tiap langkah menghasilkan *slice* yang bisa dijalankan & **di-review dulu (✅ Checkpoint)** sebelum lanjut ke prompt berikutnya — mengurangi risiko AI salah arah dan memudahkan koreksi per bagian.
+> Bagian ini menyediakan **dua bentuk**: **5A** — satu prompt konsolidasi (memenuhi instruksi rubrik *"ubah semua plan menjadi satu prompt 5 komponen"*); dan **5B** — versi terpecah 6 tahap untuk eksekusi bertahap dengan checkpoint. Keduanya merangkum keputusan Bagian 1–4 (sudah direvisi: string bukan enum, faktor keamanan, timezone, normalisasi HP, dll.).
+
+## 5A — Prompt Tunggal (untuk penilaian)
+
+> Satu prompt 5-komponen, *self-contained* & *context-aware*. Cukup kirim sekali ke AI.
+
+```
+[KONTEKS]
+Saya mengembangkan aplikasi PMB (Penerimaan Mahasiswa Baru) yang SUDAH BERJALAN — ini
+pengembangan LANJUTAN, bukan project baru. Stack: React 18 + Tailwind (frontend, Vite,
+routing path-based di App.jsx) & Laravel 12 + SQLite + Sanctum (backend). Fitur existing
+yang TIDAK BOLEH rusak: pendaftaran online, generate nomor pendaftaran, cek status by
+nomor, dashboard admin + statistik, update status, login admin (Sanctum), export CSV,
+heregistrasi. Tabel existing: `pendaftars` (id, nomor_pendaftaran[unique], nama, nomor_hp,
+email, asal_sekolah, prodi, jalur, status['Menunggu'/'Lolos Seleksi'/'Tidak Lolos'],
+heregistrasi_at) & `users` (admin Sanctum, HasApiTokens). Konvensi: response
+{ success, data, message }; controller di app/Http/Controllers/Api; validasi FormRequest;
+route admin auth:sanctum, route peserta publik; nilai status disimpan sebagai string +
+konstanta model (project ini TIDAK memakai enum). Frontend: helper src/utils/api.js
+(apiFetch + Bearer token di sessionStorage 'pmb_admin_token'); komponen Button
+(primary/secondary/danger/success), Input (meneruskan `type` → date/time native didukung),
+StatusBadge (hardcode 3 status pendaftaran); warna utama blue-600; kartu "bg-white border
+border-slate-200 rounded-xl".
+
+[TUJUAN]
+Tambahkan MODUL PENJADWALAN TES SELEKSI & WAWANCARA. Modul menjadwalkan peserta berstatus
+'Lolos Seleksi' (= lolos administrasi) ke sesi tes tulis & wawancara, mengirim notifikasi
+multi-channel (in-app + email + WhatsApp) + reminder H-1, serta menyediakan alur reschedule.
+Scope: CRUD sesi, assignment, halaman jadwal peserta, reschedule, penandaan kehadiran.
+
+[FITUR]
+- Admin: CRUD sesi (tanggal, waktu, lokasi/link, kuota, penguji, prodi_target); assign
+  peserta Lolos Seleksi (manual & auto-distribute by kuota + prodi_target); dashboard
+  kapasitas & kehadiran; setujui/tolak reschedule; kirim notifikasi & reminder.
+- Peserta (tanpa login, via nomor_pendaftaran + faktor verifikasi kedua): lihat jadwal,
+  konfirmasi kehadiran, ajukan reschedule, terima notifikasi.
+- Penguji (users.role='penguji'): lihat sesi yang ditugaskan, daftar peserta, tandai
+  kehadiran, input catatan.
+- Sistem: notifikasi saat assign/ubah jadwal; reminder H-1 via scheduler.
+
+[CONSTRAINT]
+- JANGAN ubah skema/kolom `pendaftars` (read-only: status='Lolos Seleksi', nama, email,
+  nomor_hp). Jangan rusak fitur lama.
+- 4 tabel baru (migration) + 1 kolom additive users.role. Kolom bernilai terbatas pakai
+  VARCHAR + konstanta model + validasi in: (BUKAN enum, ikut pola pendaftars.status):
+  1) sesi_tes(id, kode_sesi[string20 unique], tipe[string20:'Tes Tulis'/'Wawancara'],
+     prodi_target[string50 nullable], tanggal[date], waktu_mulai[time], waktu_selesai
+     [time], lokasi[string150 nullable], link_online[string255 nullable],
+     kuota[unsignedSmallInt default 0], penguji_id[FK users.id nullable], timestamps)
+  2) jadwal_peserta(id, pendaftar_id[FK pendaftars.id cascade], sesi_tes_id[FK sesi_tes.id
+     cascade], status_kehadiran[string20 default 'Terjadwal':'Terjadwal'/'Hadir'/'Tidak
+     Hadir'/'Dijadwal Ulang'], konfirmasi_hadir[bool default false], konfirmasi_at[ts
+     nullable], catatan_penguji[text nullable], timestamps, UNIQUE(pendaftar_id,sesi_tes_id))
+  3) permintaan_reschedule(id, jadwal_peserta_id[FK cascade], alasan[text], sesi_tujuan_id
+     [FK sesi_tes.id nullable], status[string20 default 'Menunggu':'Menunggu'/'Disetujui'/
+     'Ditolak'], diproses_oleh[FK users.id nullable], diproses_at[ts nullable], timestamps)
+  4) notifikasi_log(id, jadwal_peserta_id[FK cascade], channel[string20:'in_app'/'email'/
+     'whatsapp'], tipe[string50], status_kirim[string20 default 'tertunda':'terkirim'/
+     'gagal'/'tertunda'], error_message[string255 nullable], dikirim_at[ts nullable], timestamps)
+  + users.role[string20 default 'admin'] (migration terpisah, additive).
+- Index: sesi_tes.tanggal, sesi_tes.penguji_id, sesi_tes.prodi_target,
+  jadwal_peserta.pendaftar_id, jadwal_peserta.sesi_tes_id, jadwal_peserta.status_kehadiran,
+  permintaan_reschedule.status, notifikasi_log(jadwal_peserta_id, channel).
+- Endpoint ikut pola { success, data, message } + FormRequest. Endpoint admin & penguji:
+  auth:sanctum + gate role (role:admin vs role:penguji; token penguji TIDAK boleh akses
+  fungsi admin). Endpoint peserta PUBLIK berbasis nomor_pendaftaran TAPI WAJIB faktor
+  verifikasi kedua (mis. 4 digit akhir nomor_hp / tanggal lahir) + middleware throttle
+  (nomor mudah ditebak). Endpoint peserta TIDAK mengembalikan catatan_penguji/hasil.
+- Assign: tolak bila kuota penuh, bungkus cek-kuota+insert dalam DB transaction +
+  lockForUpdate (anti-race); cegah sesi identik (UNIQUE) DAN dua sesi ber-tipe sama
+  (validasi aplikasi).
+- Notifikasi: Job queueable (QUEUE_CONNECTION=database; jalankan queue:work); email via
+  Laravel Mail (MAIL_MAILER=log default = aman tanpa SMTP); WhatsApp via Http::post ke
+  gateway (Fonnte/Twilio) — NORMALISASI nomor_hp 08→62 dulu. Graceful degradation: bila
+  SMTP/WA gagal/tak dikonfigurasi → catat 'gagal' di notifikasi_log, in_app tetap jalan,
+  proses tak berhenti. Reminder H-1 via Task Scheduler memakai timezone Asia/Jakarta
+  (config existing UTC → set/konversi) & idempotent (cek notifikasi_log tipe 'reminder_h1').
+- Frontend: tambah scheduleApi di src/utils/api.js (pola apiFetch); halaman admin baru
+  '/admin/jadwal' + halaman penguji '/penguji' via routing path-based di App.jsx (JANGAN
+  pasang React Router). Date/time pakai input native (type=date/time); react-day-picker &
+  date-fns OPSIONAL. StatusBadge: PERLUAS peta warnanya untuk status_kehadiran (uji regresi)
+  atau buat KehadiranBadge terpisah — BUKAN reuse apa adanya.
+
+[TAMPILAN]
+Konsisten UI existing: blue-600; kartu "bg-white border border-slate-200 rounded-xl"; badge
+kehadiran berwarna (Terjadwal=biru/abu, Hadir=hijau, Tidak Hadir=merah, Dijadwal Ulang=
+kuning). Halaman admin "Kelola Jadwal": form buat sesi (input date/time native), tabel sesi
++ kapasitas terisi, panel assign peserta Lolos Seleksi (multi-select), antrean reschedule
+(Setujui/Tolak). Halaman peserta: PERLUAS Cek Status secara ADITIF — DI BAWAH hasil status
+existing tampilkan kartu jadwal (tanggal, jam, lokasi/link, status) + tombol "Konfirmasi
+Kehadiran" (success) & "Ajukan Reschedule" (secondary, modal alasan). Halaman penguji:
+daftar sesi + tabel peserta dengan aksi tandai kehadiran. Semua responsive, min-h-[44px].
+
+[UJI MANDIRI]
+`php artisan migrate` jalan di DB existing TANPA mengubah skema pendaftars; seluruh fitur
+lama (pendaftaran, cek status, dashboard, export CSV, heregistrasi) tetap normal; endpoint
+peserta menolak akses tanpa faktor kedua; assign menolak kuota penuh & double-tipe;
+notifikasi tetap jalan walau tanpa SMTP/WA.
+```
+
+---
+
+## 5B — Eksekusi Bertahap (panduan implementasi)
+
+> Alih-alih **satu prompt besar**, 5B dipecah menjadi **6 prompt berurutan** yang dijalankan **satu per satu**. Tujuannya: tiap langkah menghasilkan *slice* yang bisa dijalankan & **di-review dulu (✅ Checkpoint)** sebelum lanjut ke prompt berikutnya — mengurangi risiko AI salah arah dan memudahkan koreksi per bagian.
 >
 > **Cara pakai:**
 > 1. Paste **Konteks Bersama** di bawah ini **sekali** di awal sesi AI (atau prepend ke Prompt 1).
@@ -349,6 +473,10 @@ ATURAN GLOBAL (berlaku di setiap prompt):
   fitur lama. JANGAN mengubah skema tabel `pendaftars`.
 - Kerjakan HANYA scope prompt yang sedang aktif. Jangan lompat ke tahap berikutnya.
 - Ikuti konvensi response { success, data, message } dan pola apiFetch yang sudah ada.
+- Kolom bernilai terbatas pakai `string` + konstanta model (project ini TIDAK pakai enum).
+- Endpoint admin/penguji: auth:sanctum + gate role. Endpoint publik peserta: WAJIB faktor
+  verifikasi kedua (mis. 4 digit akhir nomor_hp) + middleware throttle.
+- Timezone Asia/Jakarta untuk reminder/tampilan; normalisasi nomor_hp 08→62 untuk WhatsApp.
 ```
 
 ---
@@ -369,29 +497,31 @@ skema tabel pendaftars.
 - Seeder: 1 user penguji + 2 contoh sesi (1 Tes Tulis, 1 Wawancara).
 
 [CONSTRAINT]
-- Buat 4 migration:
-  1) sesi_tes(id, kode_sesi[string20 unique], tipe[enum 'Tes Tulis'/'Wawancara'],
-     tanggal[date], waktu_mulai[time], waktu_selesai[time], lokasi[string150 nullable],
-     link_online[string255 nullable], kuota[unsignedSmallInteger default 0],
-     penguji_id[FK users.id nullable], timestamps)
+- Kolom bernilai terbatas pakai `string` + konstanta di model + validasi (BUKAN enum —
+  ikut pola pendaftars.status; project ini tak punya satu pun enum). Buat 4 migration:
+  1) sesi_tes(id, kode_sesi[string20 unique], tipe[string20: 'Tes Tulis'/'Wawancara'],
+     prodi_target[string50 nullable], tanggal[date], waktu_mulai[time], waktu_selesai[time],
+     lokasi[string150 nullable], link_online[string255 nullable],
+     kuota[unsignedSmallInteger default 0], penguji_id[FK users.id nullable], timestamps)
   2) jadwal_peserta(id, pendaftar_id[FK pendaftars.id cascadeOnDelete],
      sesi_tes_id[FK sesi_tes.id cascadeOnDelete],
-     status_kehadiran[enum 'Terjadwal'/'Hadir'/'Tidak Hadir'/'Dijadwal Ulang' default
-     'Terjadwal'], konfirmasi_hadir[boolean default false], konfirmasi_at[timestamp
+     status_kehadiran[string20 default 'Terjadwal': 'Terjadwal'/'Hadir'/'Tidak Hadir'/
+     'Dijadwal Ulang'], konfirmasi_hadir[boolean default false], konfirmasi_at[timestamp
      nullable], catatan_penguji[text nullable], timestamps,
      UNIQUE(pendaftar_id, sesi_tes_id))
   3) permintaan_reschedule(id, jadwal_peserta_id[FK cascadeOnDelete], alasan[text],
-     sesi_tujuan_id[FK sesi_tes.id nullable], status[enum 'Menunggu'/'Disetujui'/'Ditolak'
-     default 'Menunggu'], diproses_oleh[FK users.id nullable], diproses_at[timestamp
-     nullable], timestamps)
+     sesi_tujuan_id[FK sesi_tes.id nullable], status[string20 default 'Menunggu':
+     'Menunggu'/'Disetujui'/'Ditolak'], diproses_oleh[FK users.id nullable],
+     diproses_at[timestamp nullable], timestamps)
   4) notifikasi_log(id, jadwal_peserta_id[FK cascadeOnDelete],
-     channel[enum 'in_app'/'email'/'whatsapp'], tipe[string50],
-     status_kirim[enum 'terkirim'/'gagal'/'tertunda' default 'tertunda'],
+     channel[string20: 'in_app'/'email'/'whatsapp'], tipe[string50],
+     status_kirim[string20 default 'tertunda': 'terkirim'/'gagal'/'tertunda'],
      error_message[string255 nullable], dikirim_at[timestamp nullable], timestamps)
+  Definisikan nilai-nilai di atas sebagai konstanta di model (mis. SesiTes::TIPE_*).
 - Migration TERPISAH: tambah kolom users.role[string20 default 'admin'] (additive,
   aman untuk data lama).
-- Index: sesi_tes.tanggal, sesi_tes.penguji_id, jadwal_peserta.pendaftar_id,
-  jadwal_peserta.sesi_tes_id, jadwal_peserta.status_kehadiran,
+- Index: sesi_tes.tanggal, sesi_tes.penguji_id, sesi_tes.prodi_target,
+  jadwal_peserta.pendaftar_id, jadwal_peserta.sesi_tes_id, jadwal_peserta.status_kehadiran,
   permintaan_reschedule.status, notifikasi_log(jadwal_peserta_id, channel).
 - Buat model SesiTes, JadwalPeserta, PermintaanReschedule, NotifikasiLog dengan $fillable
   & $casts yang tepat (date/time/boolean/datetime). Relationship: SesiTes hasMany
@@ -426,19 +556,20 @@ skema tabel pendaftars.
 - SesiTesController: index, store, update, destroy.
 - GET daftar peserta eligible (BACA pendaftars WHERE status='Lolos Seleksi').
 - JadwalPesertaController@store: assign peserta ke sesi (mendukung 1/banyak peserta;
-  sediakan juga opsi auto-distribute by kuota).
+  sediakan juga opsi auto-distribute by kuota + prodi_target — cocokkan pendaftars.prodi).
 - Endpoint data dashboard: kapasitas terisi per sesi + rekap kehadiran.
 
 [CONSTRAINT]
-- Semua route di blok middleware auth:sanctum. Path: GET/POST /api/jadwal/sesi,
-  PUT/DELETE /api/jadwal/sesi/{id}, GET /api/jadwal/eligible-peserta,
-  POST /api/jadwal/assign, GET /api/jadwal/dashboard.
+- Semua route di blok middleware auth:sanctum + gate role:admin (token penguji ditolak).
+  Path: GET/POST /api/jadwal/sesi, PUT/DELETE /api/jadwal/sesi/{id},
+  GET /api/jadwal/eligible-peserta, POST /api/jadwal/assign, GET /api/jadwal/dashboard.
 - Validasi pakai FormRequest (StoreSesiTesRequest, AssignPesertaRequest). Generate
   kode_sesi unik (mis. TES-2025-XXX) di controller, mirip pola generate nomor pendaftar.
 - Tolak assignment bila jumlah jadwal_peserta untuk sesi >= kuota → kembalikan
-  { success:false, message:'Kuota sesi penuh' }, HTTP 422.
-- Cegah double-assign: andalkan UNIQUE(pendaftar_id, sesi_tes_id); tangani error
-  duplikasi dengan pesan jelas.
+  { success:false, message:'Kuota sesi penuh' }, HTTP 422. Bungkus cek-kuota+insert dalam
+  DB transaction + lockForUpdate agar tidak terjadi race condition.
+- Cegah double-assign DUA lapis: (a) sesi identik via UNIQUE(pendaftar_id, sesi_tes_id);
+  (b) dua sesi ber-tipe sama via validasi aplikasi (cek peserta belum punya jadwal tipe tsb).
 - Pastikan pendaftar yang di-assign memang berstatus 'Lolos Seleksi' (validasi server).
 - BACA pendaftars read-only; jangan ubah kolom apa pun di pendaftars.
 - Semua response ikut format { success, data, message }.
@@ -447,7 +578,7 @@ skema tabel pendaftars.
 [TAMPILAN] Tidak ada UI di tahap ini.
 
 [✅ CHECKPOINT — verifikasi sebelum lanjut ke Prompt 3]
-1. Tanpa token → endpoint /api/jadwal/* mengembalikan 401.
+1. Tanpa token → endpoint /api/jadwal/* mengembalikan 401; token penguji → 403 (gate role).
 2. Login admin existing → buat sesi (POST) berhasil, kode_sesi tergenerate unik.
 3. GET eligible-peserta HANYA mengembalikan pendaftar berstatus 'Lolos Seleksi'.
 4. Assign sampai kuota penuh → assignment berikutnya ditolak 'Kuota sesi penuh'.
@@ -470,13 +601,18 @@ degradation.
 - Job KirimNotifikasi (queueable) yang dipanggil setelah assignment di Tahap 2: tulis
   notifikasi_log untuk channel in_app, kirim email (Mailable), dan kirim WhatsApp.
 - Mailable Markdown "JadwalTesMail" berisi detail sesi.
-- Pengiriman WhatsApp via Http::post ke gateway (Fonnte/Twilio), kredensial dari .env.
+- Pengiriman WhatsApp via Http::post ke gateway (Fonnte/Twilio), kredensial dari .env;
+  NORMALISASI nomor_hp (mis. 08xxxx → 628xxxx) sebelum kirim.
 - Artisan command "jadwal:reminder" + registrasi di Console scheduler (harian) untuk
-  mengirim reminder H-1 (sesi dengan tanggal = besok).
+  mengirim reminder H-1 (sesi dengan tanggal = besok, dihitung di timezone Asia/Jakarta).
 
 [CONSTRAINT]
-- Queue driver 'database' (sediakan migration jobs bila belum ada). Email & WhatsApp
-  dikirim async via queue.
+- Queue driver 'database' (tabel jobs sudah ada). Email & WhatsApp dikirim async via queue
+  (perlu `queue:work` berjalan agar diproses).
+- Timezone: hitung "besok" untuk reminder & tampilkan jam dalam Asia/Jakarta (config
+  existing UTC → set config atau konversi eksplisit) supaya tidak meleset ±7 jam.
+- Normalisasi nomor_hp ke format 62… sebelum kirim WA; nomor tidak valid → catat 'gagal'
+  di notifikasi_log (tidak menghentikan proses).
 - GRACEFUL DEGRADATION: bila SMTP / WA gateway tidak terkonfigurasi di .env atau gagal,
   JANGAN lempar fatal — set notifikasi_log.status_kirim='gagal' + error_message,
   channel in_app tetap 'terkirim'. Proses penjadwalan tidak boleh terhenti.
@@ -518,23 +654,27 @@ menyetujui/menolak reschedule dan endpoint PENGUJI menandai kehadiran.
   (Hadir/Tidak Hadir) + catatan opsional.
 
 [CONSTRAINT]
-- Endpoint peserta PUBLIK (tanpa token), pola sama seperti GET /pendaftar/{nomor} existing.
-  Endpoint admin & penguji diproteksi auth:sanctum.
-- Saat approve reschedule: cek kuota sesi tujuan; bila penuh → tolak dengan pesan jelas;
-  bila sukses → UPDATE jadwal_peserta.sesi_tes_id + set status permintaan, lalu dispatch
-  Job KirimNotifikasi (REUSE dari Tahap 3) untuk memberi tahu peserta.
-- Validasi FormRequest; pastikan nomor_pendaftaran valid & milik peserta yang dimaksud.
+- Endpoint peserta PUBLIK (tanpa token) TAPI WAJIB faktor verifikasi kedua (mis. 4 digit
+  akhir nomor_hp / tanggal lahir) + middleware throttle — karena nomor_pendaftaran mudah
+  ditebak. Endpoint TIDAK mengembalikan catatan_penguji/hasil. Endpoint admin & penguji
+  diproteksi auth:sanctum + gate role (role:admin / role:penguji).
+- Saat approve reschedule (dalam DB transaction + lock): cek kuota sesi tujuan; bila penuh →
+  tolak dengan pesan jelas; bila sukses → UPDATE jadwal_peserta.sesi_tes_id +
+  status_kehadiran='Terjadwal' + set status permintaan, lalu dispatch Job KirimNotifikasi
+  (REUSE dari Tahap 3) untuk memberi tahu peserta.
+- Validasi FormRequest; pastikan nomor_pendaftaran + faktor kedua valid & milik peserta.
 - Penguji hanya boleh menandai kehadiran untuk sesi miliknya (penguji_id == user).
 - Response { success, data, message }. Jangan ubah skema pendaftars.
 
 [TAMPILAN] Tidak ada UI di tahap ini.
 
 [✅ CHECKPOINT — verifikasi sebelum lanjut ke Prompt 5]
-1. GET /api/jadwal/peserta/{nomor} (tanpa token) mengembalikan jadwal peserta tsb.
+1. GET jadwal peserta dengan nomor + faktor kedua yang benar → jadwal tampil; faktor kedua
+   salah → ditolak; spam request → kena throttle. Response tidak memuat catatan_penguji.
 2. Konfirmasi kehadiran & ajukan reschedule tersimpan (cek tabel).
 3. Admin approve reschedule → sesi peserta pindah + notifikasi terpicu; bila kuota tujuan
    penuh → ditolak.
-4. Penguji menandai kehadiran hanya pada sesinya; sesi penguji lain → ditolak.
+4. Penguji menandai kehadiran hanya pada sesinya; sesi penguji lain / token admin-only → ditolak.
 ```
 
 ---
@@ -560,8 +700,10 @@ UI & arsitektur frontend existing (routing path-based, apiFetch, komponen UI reu
 [CONSTRAINT]
 - REUSE apiFetch (token sessionStorage 'pmb_admin_token'). JANGAN pasang React Router baru
   — pakai pola routing path-based di App.jsx seperti '/admin'.
-- REUSE komponen Button (variant primary/success/danger), Input, StatusBadge. Pakai
-  react-day-picker untuk date picker dan date-fns (locale id) untuk format tanggal.
+- REUSE komponen Button (variant primary/success/danger) & Input. Untuk badge
+  status_kehadiran: PERLUAS peta warna StatusBadge (uji regresi tampilan status lama) ATAU
+  buat KehadiranBadge terpisah — bukan reuse apa adanya. Date/time pakai input native
+  (`type="date"/"time"`); react-day-picker & date-fns OPSIONAL (hanya bila perlu).
 - Jangan mengubah halaman existing selain MENAMBAH link navigasi ke '/admin/jadwal'.
 - Tangani state loading/error mengikuti pola komponen existing (mis. Admin.jsx).
 - Bila token invalid (401), arahkan ke login seperti perilaku existing.
@@ -605,13 +747,15 @@ fitur lama.
 - Peserta TANPA login — pakai nomor_pendaftaran (pola Cek Status existing). Perubahan di
   CekStatus harus ADITIF: blok jadwal muncul DI BAWAH hasil cek status yang sudah ada,
   tidak mengubah/menghapus perilaku lama.
-- REUSE Button, Input, StatusBadge; routing path-based di App.jsx (jangan React Router).
-- Halaman penguji pakai auth:sanctum (token), bedakan dari admin via users.role.
+- REUSE Button & Input; untuk badge kehadiran pakai StatusBadge yang sudah diperluas
+  (Tahap 5) atau KehadiranBadge; routing path-based di App.jsx (jangan React Router).
+- Halaman penguji pakai auth:sanctum + gate role:penguji (bedakan dari admin via users.role).
 - Konsisten tema (blue-600, kartu bg-white border-slate-200 rounded-xl), responsive.
 
 [TAMPILAN]
-Kartu jadwal peserta memakai StatusBadge berwarna sesuai status_kehadiran; tombol
-"Konfirmasi Kehadiran" (variant success) & "Ajukan Reschedule" (variant secondary).
+Kartu jadwal peserta memakai badge kehadiran berwarna (StatusBadge yang diperluas /
+KehadiranBadge) sesuai status_kehadiran; tombol "Konfirmasi Kehadiran" (variant success)
+& "Ajukan Reschedule" (variant secondary).
 Halaman penguji: tabel peserta dengan dropdown/tombol kehadiran. Mobile-friendly.
 
 [✅ CHECKPOINT FINAL — uji fungsional + REGRESI]
